@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-KIT_URL="${AGENTAR_KIT_URL:-https://catchclaw.me/api/v1/agentar/cli/latest.tar.gz}"
+KIT_URL="${AGENTAR_KIT_URL:-https://github.com/OpenAgentar/catchclaw/releases/download/v1.0.0/agentar-cli-v3.3.2.tar.gz}"
 
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT

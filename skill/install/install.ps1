@@ -10,7 +10,7 @@
 #>
 $ErrorActionPreference = "Stop"
 
-$KitUrl = if ($env:AGENTAR_KIT_URL) { $env:AGENTAR_KIT_URL } else { "https://catchclaw.me/api/v1/agentar/cli/latest.tar.gz" }
+$KitUrl = if ($env:AGENTAR_KIT_URL) { $env:AGENTAR_KIT_URL } else { "https://github.com/OpenAgentar/catchclaw/releases/download/v1.0.0/agentar-cli-v3.3.2.tar.gz" }
 
 $TmpDir = Join-Path ([System.IO.Path]::GetTempPath()) "agentar-bootstrap-$([System.Guid]::NewGuid().ToString('N').Substring(0,8))"
 New-Item -ItemType Directory -Force -Path $TmpDir | Out-Null
