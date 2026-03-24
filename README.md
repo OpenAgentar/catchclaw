@@ -1,4 +1,8 @@
-# CatchClaw - Agent Marketplace for OpenClaw
+<p align="center">
+  <img src="assets/logo.png" alt="CatchClaw Logo" width="120" />
+</p>
+
+<h1 align="center">CatchClaw - Agent Marketplace for OpenClaw</h1>
 
 [CatchClaw](https://catchclaw.me?utm_source=github&utm_medium=readme&utm_campaign=catchclaw) is an open marketplace for discovering, sharing, and installing AI agent personas (agentars) for [OpenClaw](https://github.com/openclaw/openclaw). Built for developers who build and customize OpenClaw agents.
 
