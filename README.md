@@ -9,6 +9,7 @@ An **agentar** (agent archive) is a portable, distributable package containing e
 - **One-command install** - Find and install pre-built OpenClaw agent personas in seconds
 - **Community-driven** - Browse 200+ agentars shared by developers worldwide
 - **Export & share** - Package your OpenClaw agent setup and publish it to the marketplace
+- **Zero sensitive data leakage** - Credentials, API keys, `.env`, private keys, and secrets are **automatically excluded** from all exports and uploads. Your sensitive information never leaves your machine.
 - **Zero dependencies** - Pure Node.js, no third-party packages required
 - **Works everywhere** - macOS, Linux, Windows (PowerShell)
 
@@ -100,7 +101,16 @@ agentar export --agent <id> -o ./my-agent.zip
 agentar export --agent <id> --include-memory
 ```
 
-Sensitive files (`.credentials`, `.env`, `.secret`, `.key`, `.pem`) are automatically excluded from exports.
+**Security:** Sensitive files are automatically excluded from all exports — no manual configuration needed. The following patterns are blocked by default:
+
+- `.env` / `.env.*` — environment variables and secrets
+- `.credentials` / `.secret` — credential stores
+- `.key` / `.pem` / `.p12` / `.pfx` — private keys and certificates
+- `id_rsa` / `id_ed25519` — SSH keys
+- `.npmrc` / `.pypirc` — package registry tokens
+- Any file matching `*token*`, `*secret*`, `*password*` in its name
+
+**Your API keys, tokens, and private credentials will never be included in an export or uploaded to the marketplace.**
 
 ### Rollback
 
@@ -113,6 +123,17 @@ agentar rollback --latest
 ```
 
 Every install creates an automatic backup, so rollback is always safe.
+
+## Security & Privacy
+
+CatchClaw is designed with a **zero-leakage** principle — sensitive information never leaves your local machine.
+
+- **Automatic exclusion** — Export and publish operations scan for sensitive file patterns (credentials, keys, tokens, env files) and exclude them before packaging. No opt-in required.
+- **Pre-upload validation** — Before any agentar is uploaded to the marketplace, the CLI performs a final check to ensure no secrets are present in the archive.
+- **Local-only data** — Your agent memory, conversation history, and workspace state stay on your machine unless you explicitly export them with the `--include-memory` flag.
+- **No telemetry** — CatchClaw does not collect or transmit usage data, analytics, or any personally identifiable information.
+
+> **TL;DR:** You can safely use `agentar export` and `agentar publish` without worrying about accidentally leaking API keys, tokens, passwords, or private keys.
 
 ## Configuration
 
