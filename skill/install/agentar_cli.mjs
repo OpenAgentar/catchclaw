@@ -14,13 +14,7 @@ import os from "node:os";
 import path from "node:path";
 import readline from "node:readline";
 import { inflateRawSync, deflateRawSync } from "node:zlib";
-import { builtinModules, createRequire } from "node:module";
-
-// Resolve subprocess module from Node.js built-in registry at runtime.
-// All invocations use shell:false with array args to prevent command injection.
-const _require = createRequire(import.meta.url);
-const _cp = builtinModules.find(m => m.length === 13 && m[5] === '_' && m.startsWith('c'));
-const { spawnSync } = _require(`node:${_cp}`);
+import { spawnSync } from "node:child_process";
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
