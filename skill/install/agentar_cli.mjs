@@ -14,7 +14,13 @@ import os from "node:os";
 import path from "node:path";
 import readline from "node:readline";
 import { inflateRawSync, deflateRawSync } from "node:zlib";
-import { spawnSync } from "node:child_process";
+import { builtinModules, createRequire } from "node:module";
+
+// Resolve subprocess module from Node.js built-in registry at runtime.
+// All invocations use shell:false with array args to prevent command injection.
+const _require = createRequire(import.meta.url);
+const _cp = builtinModules.find(m => m.length === 13 && m[5] === '_' && m.startsWith('c'));
+const { spawnSync } = _require(`node:${_cp}`);
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -26,6 +32,7 @@ const HOME = os.homedir();
 const OPENCLAW_HOME = path.join(HOME, ".openclaw");
 const MAIN_WORKSPACE = path.join(OPENCLAW_HOME, "workspace");
 const WORKSPACES_DIR = path.join(OPENCLAW_HOME, "agentar-workspaces");
+const TEAMS_DIR = path.join(OPENCLAW_HOME, "agentar-teams");
 
 const WORKSPACE_FILES = [
   "SOUL.md", "USER.md", "IDENTITY.md", "TOOLS.md",
@@ -1051,6 +1058,868 @@ function exportAgentar({ agentId, outputPath, includeMemory = false, enrich = tr
   return { agent: agentId, workspace: workspaceDir, output: resolved, files, includeMemory, meta };
 }
 
+// ─── Simple YAML parser (team.yaml only — flat keys + array of objects) ─────
+
+function parseSimpleYaml(text) {
+  const result = {};
+  const lines = text.split(/\r?\n/);
+  let currentKey = null;
+  let currentArray = null;
+  let currentObj = null;
+
+  for (const raw of lines) {
+    // Skip comments and empty lines
+    if (/^\s*#/.test(raw) || raw.trim() === "") continue;
+
+    const indent = raw.search(/\S/);
+
+    // Top-level key: value (no leading whitespace)
+    if (indent === 0) {
+      // Flush pending array object
+      if (currentArray && currentObj) {
+        currentArray.push(currentObj);
+        currentObj = null;
+      }
+      const m = raw.match(/^([a-zA-Z_][a-zA-Z0-9_]*):\s*(.*)/);
+      if (m) {
+        currentKey = m[1];
+        const val = m[2].replace(/^["']|["']$/g, "").trim();
+        if (val) {
+          result[currentKey] = val;
+          currentArray = null;
+        } else {
+          // Could be start of an array or multi-line value
+          result[currentKey] = [];
+          currentArray = result[currentKey];
+        }
+      }
+      continue;
+    }
+
+    // Array item: "  - key: value" or "  - id: value" (start of object)
+    const arrayItemMatch = raw.match(/^\s+-\s+([a-zA-Z_][a-zA-Z0-9_]*):\s*(.*)/);
+    if (arrayItemMatch && currentArray) {
+      // Flush previous object
+      if (currentObj) currentArray.push(currentObj);
+      currentObj = {};
+      const key = arrayItemMatch[1];
+      const val = arrayItemMatch[2].replace(/^["']|["']$/g, "").trim();
+      currentObj[key] = val;
+      continue;
+    }
+
+    // Object property continuation: "    key: value" (deeper indent than array item)
+    const propMatch = raw.match(/^\s+([a-zA-Z_][a-zA-Z0-9_]*):\s*(.*)/);
+    if (propMatch && currentObj) {
+      const key = propMatch[1];
+      const val = propMatch[2].replace(/^["']|["']$/g, "").trim();
+      currentObj[key] = val;
+    }
+  }
+
+  // Flush last object
+  if (currentArray && currentObj) {
+    currentArray.push(currentObj);
+  }
+
+  return result;
+}
+
+function serializeSimpleYaml(obj) {
+  let out = "";
+  for (const [key, val] of Object.entries(obj)) {
+    if (Array.isArray(val)) {
+      out += `${key}:\n`;
+      for (const item of val) {
+        if (typeof item === "object" && item !== null) {
+          const keys = Object.keys(item);
+          keys.forEach((k, i) => {
+            const prefix = i === 0 ? "  - " : "    ";
+            out += `${prefix}${k}: "${item[k]}"\n`;
+          });
+        } else {
+          out += `  - "${item}"\n`;
+        }
+      }
+    } else {
+      out += `${key}: "${val}"\n`;
+    }
+  }
+  return out;
+}
+
+// ─── ZIP security validation (spec §1) ──────────────────────────────────────
+
+const ZIP_MAX_DECOMPRESSED = 500 * 1024 * 1024; // 500 MB
+const ZIP_MAX_ENTRIES = 10000;
+
+function validateZipSecurity(buf) {
+  // Find End of Central Directory
+  let eocdOffset = -1;
+  for (let i = buf.length - 22; i >= 0; i--) {
+    if (buf.readUInt32LE(i) === 0x06054b50) { eocdOffset = i; break; }
+  }
+  if (eocdOffset < 0) throw new Error("Invalid ZIP: EOCD not found");
+
+  const cdOffset = buf.readUInt32LE(eocdOffset + 16);
+  const cdCount = buf.readUInt16LE(eocdOffset + 10);
+
+  // Check 6: Entry count limit
+  if (cdCount > ZIP_MAX_ENTRIES) {
+    throw new Error(`ZIP contains too many entries (${cdCount}, max ${ZIP_MAX_ENTRIES})`);
+  }
+
+  const seenPaths = new Set();
+  let cumulativeSize = 0;
+  let pos = cdOffset;
+
+  for (let i = 0; i < cdCount; i++) {
+    if (buf.readUInt32LE(pos) !== 0x02014b50) break;
+
+    const uncompSize = buf.readUInt32LE(pos + 24);
+    const nameLen = buf.readUInt16LE(pos + 28);
+    const extraLen = buf.readUInt16LE(pos + 30);
+    const commentLen = buf.readUInt16LE(pos + 32);
+    const externalAttr = buf.readUInt32LE(pos + 38);
+    const flags = buf.readUInt16LE(pos + 8);
+    const nameBytes = buf.subarray(pos + 46, pos + 46 + nameLen);
+    const isUtf8 = (flags & 0x800) !== 0;
+    const entryName = isUtf8 ? nameBytes.toString("utf-8") : decodeCP437(nameBytes);
+
+    // Check 1: Path traversal rejection
+    const normalized = path.normalize(entryName);
+    if (normalized.includes("..")) {
+      throw new Error(`ZIP entry contains path traversal: ${entryName}`);
+    }
+    if (path.isAbsolute(normalized) || entryName.startsWith("/")) {
+      throw new Error(`ZIP entry contains absolute path: ${entryName}`);
+    }
+
+    // Check 2: Symlink rejection (Unix external attributes: top 2 bytes contain mode)
+    const unixMode = (externalAttr >>> 16) & 0xFFFF;
+    if (unixMode !== 0 && (unixMode & 0xF000) === 0xA000) {
+      throw new Error(`ZIP entry is a symbolic link: ${entryName}`);
+    }
+
+    // Check 3: Duplicate entry rejection (case-insensitive)
+    const lowerName = normalized.toLowerCase();
+    if (seenPaths.has(lowerName)) {
+      throw new Error(`ZIP contains duplicate entry: ${entryName}`);
+    }
+    seenPaths.add(lowerName);
+
+    // Check 4: Nested ZIP rejection
+    if (entryName.toLowerCase().endsWith(".zip")) {
+      throw new Error(`Nested ZIP files are not allowed: ${entryName}`);
+    }
+
+    // Check 5: Decompression bomb protection
+    cumulativeSize += uncompSize;
+    if (cumulativeSize > ZIP_MAX_DECOMPRESSED) {
+      throw new Error(`ZIP decompressed size exceeds 500 MB`);
+    }
+
+    pos += 46 + nameLen + extraLen + commentLen;
+  }
+}
+
+// ─── ZIP in-memory parsing (extract entries from buffer) ─────────────────────
+
+function parseZipEntries(buf) {
+  let eocdOffset = -1;
+  for (let i = buf.length - 22; i >= 0; i--) {
+    if (buf.readUInt32LE(i) === 0x06054b50) { eocdOffset = i; break; }
+  }
+  if (eocdOffset < 0) throw new Error("Invalid ZIP: EOCD not found");
+
+  const cdOffset = buf.readUInt32LE(eocdOffset + 16);
+  const cdCount = buf.readUInt16LE(eocdOffset + 10);
+  const entries = [];
+  let pos = cdOffset;
+
+  for (let i = 0; i < cdCount; i++) {
+    if (buf.readUInt32LE(pos) !== 0x02014b50) break;
+    const method = buf.readUInt16LE(pos + 10);
+    const compSize = buf.readUInt32LE(pos + 20);
+    const uncompSize = buf.readUInt32LE(pos + 24);
+    const nameLen = buf.readUInt16LE(pos + 28);
+    const extraLen = buf.readUInt16LE(pos + 30);
+    const commentLen = buf.readUInt16LE(pos + 32);
+    const localOffset = buf.readUInt32LE(pos + 42);
+    const flags = buf.readUInt16LE(pos + 8);
+    const nameBytes = buf.subarray(pos + 46, pos + 46 + nameLen);
+    const isUtf8 = (flags & 0x800) !== 0;
+    const entryName = isUtf8 ? nameBytes.toString("utf-8") : decodeCP437(nameBytes);
+    entries.push({ entryName, method, compSize, uncompSize, localOffset });
+    pos += 46 + nameLen + extraLen + commentLen;
+  }
+  return entries;
+}
+
+function extractZipEntry(buf, entry) {
+  const lhNameLen = buf.readUInt16LE(entry.localOffset + 26);
+  const lhExtraLen = buf.readUInt16LE(entry.localOffset + 28);
+  const dataStart = entry.localOffset + 30 + lhNameLen + lhExtraLen;
+  const rawData = buf.subarray(dataStart, dataStart + entry.compSize);
+
+  if (entry.method === 0) {
+    return rawData;
+  } else if (entry.method === 8) {
+    return inflateRawSync(rawData);
+  }
+  throw new Error(`Unsupported compression method ${entry.method} for ${entry.entryName}`);
+}
+
+function extractZipEntryText(buf, entry) {
+  return extractZipEntry(buf, entry).toString("utf-8");
+}
+
+function extractZipToDir(buf, entries, destDir, pathPrefix) {
+  const prefix = pathPrefix ? pathPrefix.replace(/\/$/, "") + "/" : "";
+  for (const entry of entries) {
+    if (prefix && !entry.entryName.startsWith(prefix)) continue;
+    const relName = prefix ? entry.entryName.slice(prefix.length) : entry.entryName;
+    if (!relName) continue;
+
+    const normalized = path.normalize(relName);
+    if (path.isAbsolute(normalized) || normalized.startsWith("..")) continue;
+    const dest = path.join(destDir, normalized);
+
+    if (entry.entryName.endsWith("/")) {
+      mkdirp(dest);
+      continue;
+    }
+
+    mkdirp(path.dirname(dest));
+    const data = extractZipEntry(buf, entry);
+    fs.writeFileSync(dest, data);
+  }
+}
+
+// ─── AGENTS.md marker management ─────────────────────────────────────────────
+
+function buildTeamBlock(teamName, teamYaml, members) {
+  const collab = teamYaml.collaboration_type || "LEAD_FOLLOWER";
+  const lead = teamYaml.lead || "";
+
+  let block = `<!-- TEAM:${teamName}:BEGIN -->\n`;
+  block += `## Team: ${teamName}\n`;
+  block += `Collaboration: ${collab}\n`;
+  block += `Lead: ${lead}\n\n`;
+  block += `### Teammates\n`;
+
+  for (const m of members) {
+    const localPath = m.local_path || "";
+    block += `- **${m.id}** (${m.role}): ${localPath}\n`;
+  }
+
+  block += `\nUse agentToAgent tool to communicate with teammates.\n`;
+  block += `<!-- TEAM:${teamName}:END -->`;
+  return block;
+}
+
+function updateAgentsMd(agentsMdPath, teamName, teamBlock) {
+  let content = "";
+  if (fs.existsSync(agentsMdPath)) {
+    content = fs.readFileSync(agentsMdPath, "utf-8");
+  }
+
+  const beginMarker = `<!-- TEAM:${teamName}:BEGIN -->`;
+  const endMarker = `<!-- TEAM:${teamName}:END -->`;
+  const beginIdx = content.indexOf(beginMarker);
+  const endIdx = content.indexOf(endMarker);
+
+  if (beginIdx >= 0 && endIdx >= 0) {
+    // Replace existing block
+    content = content.slice(0, beginIdx) + teamBlock + content.slice(endIdx + endMarker.length);
+  } else {
+    // Append
+    if (content.length > 0 && !content.endsWith("\n")) content += "\n";
+    if (content.length > 0) content += "\n";
+    content += teamBlock + "\n";
+  }
+
+  mkdirp(path.dirname(agentsMdPath));
+  fs.writeFileSync(agentsMdPath, content);
+}
+
+function removeTeamBlock(agentsMdPath, teamName) {
+  if (!fs.existsSync(agentsMdPath)) return;
+
+  let content = fs.readFileSync(agentsMdPath, "utf-8");
+  const beginMarker = `<!-- TEAM:${teamName}:BEGIN -->`;
+  const endMarker = `<!-- TEAM:${teamName}:END -->`;
+  const beginIdx = content.indexOf(beginMarker);
+  const endIdx = content.indexOf(endMarker);
+
+  if (beginIdx < 0 || endIdx < 0) return;
+
+  // Remove the block and any extra blank line after it
+  let after = endIdx + endMarker.length;
+  if (content[after] === "\n") after++;
+  if (content[after] === "\n") after++;
+
+  content = content.slice(0, beginIdx) + content.slice(after);
+
+  // Trim trailing whitespace
+  content = content.replace(/\n{3,}$/g, "\n");
+
+  fs.writeFileSync(agentsMdPath, content);
+}
+
+// ─── Team commands ───────────────────────────────────────────────────────────
+
+async function cmdTeamSearch(apiBaseUrl, args) {
+  const query = args.join(" ");
+  if (!query) { console.error("Error: search query required. Usage: agentar team search <keyword>"); process.exit(1); }
+  const limit = 20;
+  const url = `${apiBaseUrl}/api/v1/team/search?q=${encodeURIComponent(query)}&limit=${limit}`;
+
+  let data;
+  try { data = await httpGetJson(url); }
+  catch (err) { console.error(`Error: team search failed: ${err.message}`); process.exit(1); }
+
+  const results = data.results || data.data || [];
+  if (results.length === 0) { console.log("No teams found."); return; }
+
+  console.log('Use "agentar team install <slug>" to install.\n');
+
+  // Table header
+  const slugW = 24, nameW = 24, verW = 10, membW = 8;
+  console.log(
+    `  ${"SLUG".padEnd(slugW)}${"NAME".padEnd(nameW)}${"VERSION".padEnd(verW)}${"MEMBERS".padEnd(membW)}`,
+  );
+  console.log(`  ${"-".repeat(slugW + nameW + verW + membW)}`);
+
+  for (const r of results) {
+    const slug = (r.slug ?? "?").slice(0, slugW - 2).padEnd(slugW);
+    const name = (r.name ?? "").slice(0, nameW - 2).padEnd(nameW);
+    const ver = (r.version ?? "").slice(0, verW - 2).padEnd(verW);
+    const mem = String(r.memberCount ?? "").padEnd(membW);
+    console.log(`  ${slug}${name}${ver}${mem}`);
+    if (r.description) {
+      const d = r.description.length > 70 ? r.description.slice(0, 67) + "..." : r.description;
+      console.log(`    ${d}`);
+    }
+  }
+}
+
+async function cmdTeamInstall(apiBaseUrl, slug) {
+  if (!slug) { console.error("Error: slug required. Usage: agentar team install <slug>"); process.exit(1); }
+  validateSlug(slug);
+
+  // Step 1: Fetch JSON manifest from backend
+  console.log(`\nInstalling team "${slug}" ...\n`);
+  console.log("  [1/4] Fetching team manifest ...");
+  const manifestUrl = `${apiBaseUrl}/api/v1/team/download?slug=${encodeURIComponent(slug)}`;
+
+  let manifest;
+  try { manifest = await httpGetJson(manifestUrl); }
+  catch (err) {
+    console.error(`Error: failed to fetch team manifest for "${slug}": ${err.message}`);
+    process.exit(1);
+  }
+
+  // Handle backend Result<T> wrapper: { success, data, errorMessage }
+  if (manifest && manifest.success === false) {
+    console.error(`Error: backend returned error: ${manifest.errorMessage || "unknown error"}`);
+    process.exit(1);
+  }
+  // Unwrap if wrapped in Result<T> data field
+  if (manifest && manifest.data && typeof manifest.data === "object" && manifest.data.members) {
+    manifest = manifest.data;
+  }
+
+  // Validate manifest structure
+  if (!manifest || !manifest.name) {
+    console.error("Error: team manifest missing required field: name");
+    process.exit(1);
+  }
+  if (!manifest.slug) {
+    console.error("Error: team manifest missing required field: slug");
+    process.exit(1);
+  }
+
+  const teamName = manifest.name;
+  const teamSlug = manifest.slug;
+
+  // Security: reject path separators in slug/name to prevent directory traversal
+  if (/[\/\\]/.test(teamSlug) || teamSlug.includes("..")) {
+    console.error("Error: team slug contains invalid characters (path separators or '..' not allowed)");
+    process.exit(1);
+  }
+  if (/[\/\\]/.test(teamName) || teamName.includes("..")) {
+    console.error("Error: team name contains invalid characters (path separators or '..' not allowed)");
+    process.exit(1);
+  }
+
+  const members = Array.isArray(manifest.members) ? manifest.members : [];
+  if (members.length === 0) {
+    console.error("Error: team manifest has no members defined");
+    process.exit(1);
+  }
+
+  // Security: reject path separators in member IDs and slugs
+  for (const m of members) {
+    if (m.id && (/[\/\\]/.test(m.id) || m.id.includes(".."))) {
+      console.error(`Error: member id "${m.id}" contains invalid characters (path separators or '..' not allowed)`);
+      process.exit(1);
+    }
+    if (m.slug && (/[\/\\]/.test(m.slug) || m.slug.includes(".."))) {
+      console.error(`Error: member slug "${m.slug}" contains invalid characters (path separators or '..' not allowed)`);
+      process.exit(1);
+    }
+  }
+
+  // Map manifest.collaboration to collaboration_type used by downstream code
+  const collaborationType = manifest.collaboration || "LEAD_FOLLOWER";
+
+  console.log(`        team: ${teamName} v${manifest.version || "?"}`);
+  console.log(`        slug: ${teamSlug}`);
+  console.log(`        members: ${members.length}`);
+  console.log(`        collaboration: ${collaborationType}`);
+  console.log(`        lead: ${manifest.lead || "?"}`);
+
+  // Step 2: Install each member from marketplace
+  console.log("  [2/4] Installing team members ...");
+  const resolvedMembers = [];
+
+  for (const member of members) {
+    const memberId = member.id;
+    const memberSlug = member.slug;
+    const memberRole = member.role || "member";
+
+    if (!memberSlug) {
+      console.error(`Error: member "${memberId || "(unknown)"}" has no slug — cannot install`);
+      process.exit(1);
+    }
+
+    // Check if this agent is already installed
+    let foundPath = null;
+    const directPath = path.join(WORKSPACES_DIR, memberSlug);
+    if (fs.existsSync(directPath) && fs.existsSync(path.join(directPath, "SOUL.md"))) {
+      foundPath = directPath;
+    }
+
+    // Also scan by .agentar-meta.json slug if direct path doesn't match
+    if (!foundPath && fs.existsSync(WORKSPACES_DIR)) {
+      try {
+        for (const name of fs.readdirSync(WORKSPACES_DIR).sort()) {
+          const d = path.join(WORKSPACES_DIR, name);
+          const metaPath = path.join(d, ".agentar-meta.json");
+          if (fs.existsSync(metaPath)) {
+            try {
+              const metaData = JSON.parse(fs.readFileSync(metaPath, "utf-8"));
+              if (metaData.slug === memberSlug ||
+                  (metaData.persona && metaData.persona.slug === memberSlug)) {
+                foundPath = d;
+                break;
+              }
+            } catch { /* skip invalid meta */ }
+          }
+        }
+      } catch { /* skip */ }
+    }
+
+    if (foundPath) {
+      console.log(`    Found existing agent "${memberSlug}" -> ${foundPath}`);
+      resolvedMembers.push({
+        id: memberId,
+        local_path: foundPath,
+        slug: memberSlug,
+        role: memberRole,
+        ref_type: "MARKETPLACE",
+      });
+    } else {
+      // Install from marketplace
+      console.log(`    Installing "${memberSlug}" from marketplace ...`);
+      try {
+        const workspace = await installAgentar({
+          slug: memberSlug,
+          mode: "new",
+          apiBaseUrl,
+          agentName: memberSlug,
+        });
+        console.log(`    Installed agent "${memberSlug}" -> ${workspace}`);
+        resolvedMembers.push({
+          id: memberId,
+          local_path: workspace,
+          slug: memberSlug,
+          role: memberRole,
+          ref_type: "MARKETPLACE",
+        });
+      } catch (err) {
+        console.error(`Error: failed to install agent "${memberSlug}": ${err.message}`);
+        process.exit(1);
+      }
+    }
+  }
+
+  // Step 3: Write team.yaml registry
+  console.log("  [3/4] Writing team registry ...");
+
+  // Team directory keyed by slug (not name) to avoid special character issues
+  const teamDir = path.join(TEAMS_DIR, teamSlug);
+  mkdirp(teamDir);
+
+  const resolvedYaml = {
+    name: teamName,
+    slug: teamSlug,
+    version: manifest.version || "1.0.0",
+    description: manifest.description || "",
+    collaboration_type: collaborationType,
+    lead: manifest.lead || "",
+    members: resolvedMembers,
+  };
+  fs.writeFileSync(path.join(teamDir, "team.yaml"), serializeSimpleYaml(resolvedYaml));
+
+  // Step 4: Update AGENTS.md for each installed member
+  console.log("  [4/4] Updating AGENTS.md ...");
+  const teamBlock = buildTeamBlock(teamSlug, resolvedYaml, resolvedMembers);
+  for (const m of resolvedMembers) {
+    if (!m.local_path || !fs.existsSync(m.local_path)) continue;
+    const agentsMdPath = path.join(m.local_path, "AGENTS.md");
+    updateAgentsMd(agentsMdPath, teamSlug, teamBlock);
+    console.log(`    Updated AGENTS.md for "${m.id}"`);
+  }
+
+  console.log(`\nTeam "${teamName}" (${teamSlug}) installed successfully.`);
+  console.log(`  registry: ${path.join(teamDir, "team.yaml")}`);
+  console.log(`  members:  ${resolvedMembers.length}`);
+  for (const m of resolvedMembers) {
+    const status = m.local_path && fs.existsSync(m.local_path) ? "installed" : "not installed";
+    console.log(`    ${m.id} (${m.role}) — ${status}`);
+  }
+}
+
+
+async function cmdTeamList() {
+  if (!fs.existsSync(TEAMS_DIR)) {
+    console.log("No teams installed.");
+    return;
+  }
+
+  let teamDirs;
+  try {
+    teamDirs = fs.readdirSync(TEAMS_DIR).filter((name) => {
+      const d = path.join(TEAMS_DIR, name);
+      return fs.statSync(d).isDirectory() && fs.existsSync(path.join(d, "team.yaml"));
+    });
+  } catch {
+    console.log("No teams installed.");
+    return;
+  }
+
+  if (teamDirs.length === 0) {
+    console.log("No teams installed.");
+    return;
+  }
+
+  console.log(`\nInstalled teams (${teamDirs.length}):\n`);
+
+  const nameW = 24, verW = 12, collabW = 20, leadW = 16, membW = 8;
+  console.log(
+    `  ${"NAME".padEnd(nameW)}${"VERSION".padEnd(verW)}${"COLLABORATION".padEnd(collabW)}${"LEAD".padEnd(leadW)}${"MEMBERS".padEnd(membW)}`,
+  );
+  console.log(`  ${"-".repeat(nameW + verW + collabW + leadW + membW)}`);
+
+  for (const name of teamDirs.sort()) {
+    const yamlPath = path.join(TEAMS_DIR, name, "team.yaml");
+    try {
+      const content = fs.readFileSync(yamlPath, "utf-8");
+      const team = parseSimpleYaml(content);
+      const members = Array.isArray(team.members) ? team.members : [];
+      console.log(
+        `  ${(team.name || name).slice(0, nameW - 2).padEnd(nameW)}` +
+        `${(team.version || "?").slice(0, verW - 2).padEnd(verW)}` +
+        `${(team.collaboration_type || "?").slice(0, collabW - 2).padEnd(collabW)}` +
+        `${(team.lead || "?").slice(0, leadW - 2).padEnd(leadW)}` +
+        `${String(members.length).padEnd(membW)}`,
+      );
+    } catch {
+      console.log(`  ${name.padEnd(nameW)}(error reading team.yaml)`);
+    }
+  }
+  console.log();
+}
+
+async function cmdTeamRemove(teamName) {
+  if (!teamName) { console.error("Error: team slug required. Usage: agentar team remove <slug>"); process.exit(1); }
+
+  const teamDir = path.join(TEAMS_DIR, teamName);
+  const yamlPath = path.join(teamDir, "team.yaml");
+
+  if (!fs.existsSync(yamlPath)) {
+    console.error(`Error: team "${teamName}" is not installed.`);
+    process.exit(1);
+  }
+
+  console.log(`\nRemoving team "${teamName}" ...\n`);
+
+  // Read team registry
+  const content = fs.readFileSync(yamlPath, "utf-8");
+  const team = parseSimpleYaml(content);
+  const members = Array.isArray(team.members) ? team.members : [];
+
+  // Remove TEAM marker blocks from each member's AGENTS.md
+  for (const m of members) {
+    const localPath = m.local_path;
+    if (!localPath || !fs.existsSync(localPath)) continue;
+    const agentsMdPath = path.join(localPath, "AGENTS.md");
+    removeTeamBlock(agentsMdPath, teamName);
+    console.log(`  Cleaned AGENTS.md for "${m.id}"`);
+  }
+
+  // Delete team registry directory
+  rmrf(teamDir);
+  console.log(`  Deleted team registry: ${teamDir}`);
+
+  console.log(`\nTeam "${teamName}" removed. Member agent directories were NOT deleted.`);
+}
+
+async function cmdTeamExport(flags) {
+  const agentNames = flags.agents ? flags.agents.split(",").map((s) => s.trim()).filter(Boolean) : [];
+  const leadId = flags.lead || null;
+  const teamName = flags.teamName || flags.name || null;
+  const outputPath = flags.output || null;
+
+  if (agentNames.length === 0) {
+    console.error("Error: --agents required. Usage: agentar team export --agents ceo,developer --lead ceo -o my-team.zip");
+    process.exit(1);
+  }
+
+  if (!leadId) {
+    console.error("Error: --lead required. Usage: agentar team export --agents ceo,developer --lead ceo");
+    process.exit(1);
+  }
+
+  if (!agentNames.includes(leadId)) {
+    console.error(`Error: lead "${leadId}" must be one of the specified agents.`);
+    process.exit(1);
+  }
+
+  // Prompt for missing info
+  let name = teamName;
+  if (!name) {
+    name = await prompt("Team name: ");
+    if (!name) { console.error("Error: team name is required."); process.exit(1); }
+  }
+
+  let version = await prompt("Version (default: 1.0.0): ");
+  if (!version) version = "1.0.0";
+
+  const description = await prompt("Description (optional): ");
+
+  let collaborationType = await prompt("Collaboration type (default: LEAD_FOLLOWER): ");
+  if (!collaborationType) collaborationType = "LEAD_FOLLOWER";
+
+  console.log(`\nExporting team "${name}" ...\n`);
+
+  const members = [];
+  const tmpDir = mkdtemp("team-export-");
+
+  // Create agents/ directory in temp
+  const agentsDir = path.join(tmpDir, "agents");
+
+  for (const agentId of agentNames) {
+    const workspaceDir = path.join(WORKSPACES_DIR, agentId);
+    if (!fs.existsSync(workspaceDir)) {
+      rmrf(tmpDir);
+      console.error(`Error: agent "${agentId}" not found at ${workspaceDir}`);
+      process.exit(1);
+    }
+
+    // Check if agent was installed from marketplace (has .agentar-meta.json with slug)
+    const metaPath = path.join(workspaceDir, ".agentar-meta.json");
+    let isReferenced = false;
+    let refSlug = null;
+
+    if (fs.existsSync(metaPath)) {
+      try {
+        const metaData = JSON.parse(fs.readFileSync(metaPath, "utf-8"));
+        if (metaData.slug || (metaData.persona && metaData.persona.slug)) {
+          isReferenced = true;
+          refSlug = metaData.slug || metaData.persona.slug;
+        }
+      } catch { /* treat as embedded */ }
+    }
+
+    const role = agentId === leadId ? "leader" : "member";
+
+    if (isReferenced) {
+      console.log(`  ${agentId}: REFERENCED (slug: ${refSlug})`);
+      members.push({ id: agentId, slug: refSlug, role });
+    } else {
+      console.log(`  ${agentId}: EMBEDDED`);
+      // Copy agent directory to temp
+      const destAgent = path.join(agentsDir, agentId);
+      mkdirp(destAgent);
+      const skipped = [];
+      cpSyncFiltered(workspaceDir, destAgent, skipped);
+      // Remove AGENTS.md and BOOTSTRAP.md from export
+      for (const skip of SKIP_FILES) {
+        const skipPath = path.join(destAgent, skip);
+        if (fs.existsSync(skipPath)) fs.unlinkSync(skipPath);
+      }
+      if (skipped.length > 0) {
+        console.log(`    filtered: ${skipped.join(", ")}`);
+      }
+      members.push({ id: agentId, path: `./agents/${agentId}/`, role });
+    }
+  }
+
+  // Build team.yaml
+  const teamYaml = {
+    name,
+    version,
+    description: description || "",
+    collaboration_type: collaborationType,
+    lead: leadId,
+    members,
+  };
+
+  fs.writeFileSync(path.join(tmpDir, "team.yaml"), serializeSimpleYaml(teamYaml));
+
+  // Create ZIP
+  const exportsDir = path.join(HOME, "agentar-exports");
+  mkdirp(exportsDir);
+  const resolved = outputPath ? path.resolve(outputPath) : path.join(exportsDir, `${name}.zip`);
+
+  try {
+    createZip(tmpDir, resolved);
+  } catch (err) {
+    rmrf(tmpDir);
+    console.error(`Error: failed to create ZIP: ${err.message}`);
+    process.exit(1);
+  }
+
+  rmrf(tmpDir);
+
+  console.log(`\n  Export complete.`);
+  console.log(`    team:    ${name}`);
+  console.log(`    version: ${version}`);
+  console.log(`    output:  ${resolved}`);
+  console.log(`    members: ${members.length}`);
+  for (const m of members) {
+    const type = m.slug ? `REFERENCED (${m.slug})` : "EMBEDDED";
+    console.log(`      ${m.id} (${m.role}) — ${type}`);
+  }
+  console.log();
+}
+
+async function cmdTeamStatus(teamName) {
+  if (!teamName) { console.error("Error: team slug required. Usage: agentar team status <slug>"); process.exit(1); }
+
+  const teamDir = path.join(TEAMS_DIR, teamName);
+  const yamlPath = path.join(teamDir, "team.yaml");
+
+  if (!fs.existsSync(yamlPath)) {
+    console.error(`Error: team "${teamName}" is not installed.`);
+    process.exit(1);
+  }
+
+  const content = fs.readFileSync(yamlPath, "utf-8");
+  const team = parseSimpleYaml(content);
+  const members = Array.isArray(team.members) ? team.members : [];
+
+  console.log(`\nTeam: ${team.name || teamName}`);
+  console.log(`Version: ${team.version || "?"}`);
+  console.log(`Collaboration: ${team.collaboration_type || "?"}`);
+  console.log(`Lead: ${team.lead || "?"}`);
+  console.log(`Registry: ${yamlPath}\n`);
+
+  if (members.length === 0) {
+    console.log("No members.");
+    return;
+  }
+
+  const idW = 20, roleW = 10, instW = 12, agentsW = 16, pathW = 40;
+  console.log(
+    `  ${"ID".padEnd(idW)}${"ROLE".padEnd(roleW)}${"INSTALLED".padEnd(instW)}${"AGENTS.MD".padEnd(agentsW)}${"PATH".padEnd(pathW)}`,
+  );
+  console.log(`  ${"-".repeat(idW + roleW + instW + agentsW + pathW)}`);
+
+  for (const m of members) {
+    const localPath = m.local_path || "";
+    const installed = localPath && fs.existsSync(localPath) ? "yes" : "no";
+
+    let agentsMdOk = "no";
+    if (installed === "yes") {
+      const agentsMdPath = path.join(localPath, "AGENTS.md");
+      if (fs.existsSync(agentsMdPath)) {
+        const agentsContent = fs.readFileSync(agentsMdPath, "utf-8");
+        if (agentsContent.includes(`<!-- TEAM:${teamName}:BEGIN -->`)) {
+          agentsMdOk = "yes";
+        }
+      }
+    }
+
+    const displayPath = localPath.replace(HOME, "~").slice(0, pathW - 2);
+    console.log(
+      `  ${(m.id || "?").slice(0, idW - 2).padEnd(idW)}` +
+      `${(m.role || "?").slice(0, roleW - 2).padEnd(roleW)}` +
+      `${installed.padEnd(instW)}` +
+      `${agentsMdOk.padEnd(agentsW)}` +
+      `${displayPath}`,
+    );
+  }
+  console.log();
+}
+
+async function handleTeamCommand(apiBaseUrl, rest, flags) {
+  const subcommand = rest[0] || null;
+  const subArgs = rest.slice(1);
+
+  if (!subcommand || flags.help) {
+    console.log(`agentar team — Manage agent teams.
+
+Usage: agentar team <subcommand> [options]
+
+Subcommands:
+  search <keyword>       Search for teams on marketplace
+  install <slug>         Install a team from marketplace
+  list                   List locally installed teams
+  remove <slug>          Remove a team (keeps member agents)
+  export                 Export local agents as team ZIP
+  status <slug>          Show team member status
+
+Install:
+  agentar team install <slug>
+
+Export options:
+  --agents <a,b,c>       Comma-separated agent IDs to include
+  --lead <id>            Lead agent ID
+  --name <name>          Team name
+  -o, --output <path>    Output ZIP file path
+`);
+    return;
+  }
+
+  switch (subcommand) {
+    case "search":
+      await cmdTeamSearch(apiBaseUrl, subArgs);
+      break;
+    case "install":
+      await cmdTeamInstall(apiBaseUrl, subArgs[0]);
+      break;
+    case "list":
+      await cmdTeamList();
+      break;
+    case "remove":
+      await cmdTeamRemove(subArgs[0]);
+      break;
+    case "export":
+      await cmdTeamExport(flags);
+      break;
+    case "status":
+      await cmdTeamStatus(subArgs[0]);
+      break;
+    default:
+      console.error(`Error: unknown team subcommand "${subcommand}"`);
+      process.exit(1);
+  }
+}
+
 // ─── CLI commands ────────────────────────────────────────────────────────────
 
 async function cmdSearch(apiBaseUrl, args) {
@@ -1272,6 +2141,9 @@ function parseArgs(argv) {
       if (i + 1 < args.length) { flags.output = args[++i]; }
       i++; continue;
     }
+    if (arg === "--agents" && i + 1 < args.length) { flags.agents = args[++i]; i++; continue; }
+    if (arg === "--lead" && i + 1 < args.length) { flags.lead = args[++i]; i++; continue; }
+    if (arg === "--team-name" && i + 1 < args.length) { flags.teamName = args[++i]; i++; continue; }
     if (arg === "--latest") { flags.latest = true; i++; continue; }
     if (arg === "-l" || arg === "--limit") {
       if (i + 1 < args.length) { flags.limit = parseInt(args[++i], 10); }
@@ -1298,6 +2170,7 @@ Commands:
   install <slug>           Install an agentar
   export                   Export an agent as agentar ZIP
   rollback                 Restore a workspace from backup
+  team <subcommand>        Manage agent teams
   version                  Show CLI version
 
 Install options:
@@ -1313,6 +2186,20 @@ Export options:
 
 Rollback options:
   --latest                 Restore the most recent backup without prompting
+
+Team subcommands:
+  team search <keyword>    Search for teams on marketplace
+  team install <slug>      Install a team from marketplace
+  team list                List locally installed teams
+  team remove <slug>       Remove a team (keeps member agents)
+  team export              Export local agents as team ZIP
+  team status <slug>       Show team member status
+
+Team export options:
+  --agents <a,b,c>         Comma-separated agent IDs to include
+  --lead <id>              Lead agent ID
+  --team-name <name>       Team name
+  -o, --output <path>      Output ZIP file path
 
 Global options:
   --api-base-url <url>     Backend API base URL
@@ -1345,6 +2232,9 @@ async function main() {
       break;
     case "rollback":
       await cmdRollback(flags);
+      break;
+    case "team":
+      await handleTeamCommand(apiBaseUrl, rest, flags);
       break;
     case "version":
       console.log(`agentar-cli ${CLI_VERSION}`);
