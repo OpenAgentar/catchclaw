@@ -1,0 +1,27 @@
+{
+  "name": "catchclaw-skill-gh",
+  "version": "1.0.0",
+  "description": "<p align=\"center\">   <img src=\"assets/logo.png\" alt=\"CatchClaw Logo\" width=\"120\" /> </p>",
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "test:e2e": "for t in tests/test-*.sh; do bash \"$t\" || exit 1; done"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/OpenAgentar/catchclaw.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "bugs": {
+    "url": "https://github.com/OpenAgentar/catchclaw/issues"
+  },
+  "homepage": "https://github.com/OpenAgentar/catchclaw#readme",
+  "devDependencies": {
+    "@vitest/coverage-v8": "^4.1.2",
+    "vitest": "^4.1.2"
+  }
+}

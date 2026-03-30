@@ -2246,7 +2246,21 @@ async function main() {
   }
 }
 
-main().catch((err) => {
-  console.error(`Error: ${err.message}`);
-  process.exit(1);
-});
+// Run main() only when executed directly (not when imported for testing)
+const __isDirectRun = process.argv[1] &&
+  import.meta.url.endsWith(process.argv[1].replace(/\\/g, '/'));
+if (__isDirectRun) {
+  main().catch((err) => {
+    console.error(`Error: ${err.message}`);
+    process.exit(1);
+  });
+}
+
+// Test exports (not used in CLI mode)
+export const __test__ = {
+  parseArgs, parseSimpleYaml, serializeSimpleYaml,
+  validateSlug, isSensitiveFile, decodeCP437, crc32,
+  parseZipEntries, validateZipSecurity,
+  buildTeamBlock, validatePath, describeNonZipDownload,
+  extractZipEntry, extractZipEntryText,
+};
