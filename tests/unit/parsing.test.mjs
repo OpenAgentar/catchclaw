@@ -149,6 +149,67 @@ describe('parseArgs', () => {
     expect(result.command).toBe('search')
     expect(result.rest).toEqual(['--unknown-flag'])
   })
+
+  it('parses --version flag with value', () => {
+    const result = parseArgs(['node', 'script', 'install', 'my-agent', '--version', '1.2.3'])
+    expect(result.flags.version).toBe('1.2.3')
+    expect(result.command).toBe('install')
+    expect(result.rest).toEqual(['my-agent'])
+  })
+
+  it('parses --version flag with semver+build metadata', () => {
+    const result = parseArgs(['node', 'script', 'install', 'my-agent', '--version', '1.2.3+build.42'])
+    expect(result.flags.version).toBe('1.2.3+build.42')
+  })
+
+  it('parses --version flag combined with --name', () => {
+    const result = parseArgs(['node', 'script', 'install', 'my-agent', '--name', 'writer', '--version', '2.0.0'])
+    expect(result.flags.version).toBe('2.0.0')
+    expect(result.flags.name).toBe('writer')
+    expect(result.rest).toEqual(['my-agent'])
+  })
+
+  it('does not set version flag when not provided', () => {
+    const result = parseArgs(['node', 'script', 'install', 'my-agent', '--name', 'writer'])
+    expect(result.flags.version).toBeUndefined()
+  })
+
+  // AC-103: --version combined with --overwrite
+  it('parses --version flag combined with --overwrite', () => {
+    const result = parseArgs(['node', 'script', 'install', 'my-agent', '--overwrite', '--version', '2.0.0'])
+    expect(result.flags.version).toBe('2.0.0')
+    expect(result.flags.overwrite).toBe(true)
+    expect(result.rest).toEqual(['my-agent'])
+  })
+
+  // AC-104: --version combined with --api-key
+  it('parses --version flag combined with --api-key', () => {
+    const result = parseArgs(['node', 'script', 'install', 'my-agent', '--version', '1.0.0', '--api-key', 'cck_abc123'])
+    expect(result.flags.version).toBe('1.0.0')
+    expect(result.flags.apiKey).toBe('cck_abc123')
+  })
+
+  // AC-106: --version with no following argument
+  it('ignores --version when no value follows (last arg)', () => {
+    const result = parseArgs(['node', 'script', 'install', 'my-agent', '--version'])
+    expect(result.flags.version).toBeUndefined()
+    // --version is pushed to positional since the guard fails
+    expect(result.command).toBe('install')
+  })
+
+  // AC-107: --version flag order independence
+  it('parses --version flag regardless of position among args', () => {
+    const result = parseArgs(['node', 'script', 'install', '--version', '1.0.0', 'my-agent', '--name', 'writer'])
+    expect(result.flags.version).toBe('1.0.0')
+    expect(result.flags.name).toBe('writer')
+    expect(result.rest).toEqual(['my-agent'])
+  })
+
+  // AC-108: --version with pre-release semver
+  it('parses --version flag with pre-release semver', () => {
+    const result = parseArgs(['node', 'script', 'install', 'my-agent', '--version', '2.0.0-beta.1'])
+    expect(result.flags.version).toBe('2.0.0-beta.1')
+  })
 })
 
 // ─── parseSimpleYaml ────────────────────────────────────────────────────────

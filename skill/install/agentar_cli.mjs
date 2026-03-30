@@ -793,14 +793,17 @@ function buildPersona(agentId, workspaceDir, enrich) {
   };
 }
 
-async function installAgentar({ slug, mode, apiBaseUrl, agentName, apiKey }) {
+async function installAgentar({ slug, mode, apiBaseUrl, agentName, apiKey, version }) {
   validateSlug(slug);
   const tmpDir = mkdtemp("agentar-");
   const zipPath = path.join(tmpDir, `${slug}.zip`);
 
   async function downloadFrom(base) {
-    const downloadUrl = `${base}/api/v1/agentar/download?slug=${encodeURIComponent(slug)}`;
-    console.log(`  Downloading ${slug} ...`);
+    let downloadUrl = `${base}/api/v1/agentar/download?slug=${encodeURIComponent(slug)}`;
+    if (version) {
+      downloadUrl += `&version=${encodeURIComponent(version)}`;
+    }
+    console.log(`  Downloading ${slug}${version ? ` v${version}` : ""} ...`);
     await httpDownload(downloadUrl, zipPath);
   }
 
@@ -1989,10 +1992,11 @@ async function cmdInstall(apiBaseUrl, opts) {
     slug, mode, apiBaseUrl,
     agentName: opts.name,
     apiKey: opts.apiKey,
+    version: opts.version,
   });
 
   console.log("\nInstall complete.");
-  console.log(`  agentar:   ${slug}`);
+  console.log(`  agentar:   ${slug}${opts.version ? ` v${opts.version}` : ""}`);
   console.log(`  mode:      ${mode}`);
   console.log(`  workspace: ${workspace}`);
   if (opts.apiKey) console.log(`  credentials: ${workspace}/skills/.credentials`);
@@ -2144,6 +2148,7 @@ function parseArgs(argv) {
     if (arg === "--agents" && i + 1 < args.length) { flags.agents = args[++i]; i++; continue; }
     if (arg === "--lead" && i + 1 < args.length) { flags.lead = args[++i]; i++; continue; }
     if (arg === "--team-name" && i + 1 < args.length) { flags.teamName = args[++i]; i++; continue; }
+    if (arg === "--version" && i + 1 < args.length) { flags.version = args[++i]; i++; continue; }
     if (arg === "--latest") { flags.latest = true; i++; continue; }
     if (arg === "-l" || arg === "--limit") {
       if (i + 1 < args.length) { flags.limit = parseInt(args[++i], 10); }
@@ -2177,6 +2182,7 @@ Install options:
   --name <name>            Create a new agent with this name (default when interactive)
   --overwrite              Overwrite main agent workspace (use only when user explicitly selects)
   --api-key <key>          API key to save into skills/.credentials
+  --version <ver>          Install a specific version (default: latest)
 
 Export options:
   --agent <id>             Agent ID to export (interactive if omitted)

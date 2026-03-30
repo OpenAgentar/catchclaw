@@ -1,6 +1,6 @@
 ---
 name: catchclaw
-description: "Search, install, and export agentars from the CatchClaw marketplace. Use when the user wants to find, install, or package agent templates."
+description: "Search, install, and export agentars and teams from the CatchClaw marketplace. Use when the user wants to find, install, or package agent templates or teams."
 user-invocable: true
 metadata:
   openclaw:
@@ -17,6 +17,7 @@ metadata:
         - ~/.openclaw/workspace
         - ~/.openclaw/agentar-workspaces
         - ~/agentar-exports
+        - ~/.openclaw/agentar-teams
 ---
 
 # CatchClaw Agentar Manager
@@ -32,18 +33,21 @@ An agentar is a distributable agent archive (ZIP) containing workspace files suc
 - User asks to export / package an agent as an agentar
 - User asks to rollback / undo / restore a previous agent workspace
 - User mentions the keyword "agentar" or "catchclaw"
+- User asks to search / install / list teams or "agenteam"
+- User asks to install a team from the marketplace
+- User asks to check team status or list installed teams
 
-**Important:** Before performing any action, verify the bundled CLI works (see CLI Setup). Do not run search, install, export, or rollback until verification passes.
+**Important:** Before performing any action, verify the bundled CLI works (see CLI Setup). Do not run search, install, export, rollback, or team commands until verification passes.
 
 ## CLI Setup (mandatory — run before any command)
 
 <HARD-GATE>
-**Before running any search, install, export, or rollback command, you MUST verify the bundled CLI.** The CLI (`agentar_cli.mjs`) is bundled in this skill's directory — no download or copy is needed.
+**Before running any search, install, export, rollback, or team command, you MUST verify the bundled CLI.** The CLI (`agentar_cli.mjs`) is bundled in this skill's directory — no download or copy is needed.
 
 1. **Locate:** The CLI is at the same directory as this SKILL.md (e.g. `~/.agents/skills/catchclaw/agentar_cli.mjs`).
-2. **Verify:** Run `node <skill-dir>/agentar_cli.mjs version`. Only after it succeeds, proceed with search/install/export/rollback.
+2. **Verify:** Run `node <skill-dir>/agentar_cli.mjs version`. Only after it succeeds, proceed with search/install/export/rollback/team commands.
 
-Never run `$CLI search`, `$CLI install`, `$CLI export`, or `$CLI rollback` until verification passes.
+Never run `$CLI search`, `$CLI install`, `$CLI export`, `$CLI rollback`, or `$CLI team …` until verification passes.
 </HARD-GATE>
 
 ## CLI Location
@@ -75,6 +79,7 @@ Aligned with `metadata.openclaw.requires.config` and `metadata.json` in this ski
 | `~/.openclaw/workspace` | read/write | Main agent workspace (`install --overwrite`, export) |
 | `~/.openclaw/agentar-workspaces/` | read/write | Per-agent workspaces (`install --name …`) |
 | `~/agentar-exports/` | write | Default directory for `export` ZIP output |
+| `~/.openclaw/agentar-teams/` | read/write | Team registries (`team install`, `team list`, `team status`) |
 | `<skill-dir>/skills/.credentials` | write (optional) | Written when install is run with `--api-key` |
 
 ## Commands
@@ -90,8 +95,8 @@ Search the CatchClaw marketplace for agentars matching the keyword.
 ### Install
 
 ```bash
-$CLI install <slug> --name <name> [--api-key <key>]
-$CLI install <slug> --overwrite
+$CLI install <slug> --name <name> [--api-key <key>] [--version <ver>]
+$CLI install <slug> --overwrite [--version <ver>]
 ```
 
 Install an agentar from the marketplace.
@@ -100,6 +105,7 @@ Install an agentar from the marketplace.
 - `--name <name>` — Create a new agent with the given name. Existing agents are not affected. (Preferred; list this option first when prompting.)
 - `--overwrite` — Overwrite the main agent (`~/.openclaw/workspace`). Existing workspace is backed up automatically. **Never use without the user's explicit selection.**
 - `--api-key <key>` — (Optional) API key to save into `skills/.credentials` for agentars that require backend authentication.
+- `--version <ver>` — (Optional) Install a specific version. When omitted, installs the latest version.
 
 ### Export
 
@@ -131,6 +137,61 @@ $CLI version
 
 Show the CLI version.
 
+## Team Commands
+
+### Team Search
+
+```bash
+$CLI team search <keyword>
+```
+
+Search the CatchClaw marketplace for teams matching the keyword. Results include slug, name, version, and member count.
+
+### Team Install
+
+```bash
+$CLI team install <slug>
+```
+
+Install a team and all its member agents from the marketplace.
+
+**Behavior:**
+- Fetches the team manifest (name, members, collaboration type)
+- Installs each member agent as a new agent (or reuses if already installed locally)
+- Writes team registry to `~/.openclaw/agentar-teams/<slug>/team.yaml`
+- Updates each member's `AGENTS.md` with team coordination block
+
+### Team List
+
+```bash
+$CLI team list
+```
+
+List all locally installed teams with their name, slug, version, and member count.
+
+### Team Status
+
+```bash
+$CLI team status <slug>
+```
+
+Show detailed status of a team: member agents, their install paths, and whether their `AGENTS.md` contains the team block.
+
+## Team Installation Rules
+
+<HARD-GATE>
+Before executing `team install`:
+1. **Slug required:** If the user wants to install a team but has not specified which one (no slug), run `$CLI team search <keyword>` to help the user find the team, then ask for the slug.
+2. **Confirmation (CRITICAL - MUST ASK USER):** Before executing `$CLI team install <slug>`, you MUST inform the user:
+   - "This will install team `<slug>` with its member agents. Existing agents with matching slugs will be reused. Proceed?"
+   - Only execute after explicit user confirmation.
+   - Team install creates new agent workspaces, reuses existing ones by name match, and mutates each member's `AGENTS.md`.
+
+After the user confirms, execute: `$CLI team install <slug>`
+
+Never execute team install without both: (1) a slug, and (2) explicit user confirmation.
+</HARD-GATE>
+
 ## Installation Rules
 
 <HARD-GATE>
@@ -148,8 +209,8 @@ Present the following two options to the user and wait for their response:
 - Do NOT use "overwrite" unless the user explicitly selects it
 - If the user chooses "new" but doesn't specify a name, use the slug as the default name
 
-After the user explicitly selects "new", execute: `$CLI install <slug> --name <user-specified name>`
-After the user explicitly selects "overwrite", execute: `$CLI install <slug> --overwrite`
+After the user explicitly selects "new", execute: `$CLI install <slug> --name <user-specified name>` (add `--version <ver>` if the user specified a version)
+After the user explicitly selects "overwrite", execute: `$CLI install <slug> --overwrite` (add `--version <ver>` if the user specified a version)
 
 Never execute install without both: (1) a slug, and (2) explicit user confirmation of installation mode.
 </HARD-GATE>
@@ -183,3 +244,6 @@ Never execute install without both: (1) a slug, and (2) explicit user confirmati
 2. **Install**: If the user did not specify which agentar to install (no slug), ask the user to enter the agentar name/slug. Then confirm installation mode: present [1] new, [2] overwrite; never use overwrite without explicit user selection. Only after you have both slug and mode, execute the install command.
 3. **Export**: If the user did not specify which agent to export, run `$CLI export` (no `--agent`) to list agents, present the list to the user, and ask them to choose. Only after the user selects an agent, run `$CLI export --agent <id>`. Do not export without the user's explicit selection.
 4. **Rollback**: If the user wants to undo an overwrite install, run `$CLI rollback` to list available backups and restore one.
+5. **Team Search**: Run `$CLI team search <keyword>` to find teams. Each result includes a slug identifier.
+6. **Team Install**: Confirm the slug with the user. Inform them that member agents will be installed or reused. Only after user confirmation, execute `$CLI team install <slug>`.
+7. **Team List/Status**: Run `$CLI team list` to see installed teams or `$CLI team status <slug>` for detailed member status.
