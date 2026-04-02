@@ -1420,14 +1420,17 @@ async function cmdTeamSearch(apiBaseUrl, args) {
   }
 }
 
-async function cmdTeamInstall(apiBaseUrl, slug) {
+async function cmdTeamInstall(apiBaseUrl, slug, version) {
   if (!slug) { console.error("Error: slug required. Usage: agentar team install <slug>"); process.exit(1); }
   validateSlug(slug);
 
   // Step 1: Fetch JSON manifest from backend
-  console.log(`\nInstalling team "${slug}" ...\n`);
+  console.log(`\nInstalling team "${slug}"${version ? ` v${version}` : ""} ...\n`);
   console.log("  [1/4] Fetching team manifest ...");
-  const manifestUrl = `${apiBaseUrl}/api/v1/team/download?slug=${encodeURIComponent(slug)}`;
+  let manifestUrl = `${apiBaseUrl}/api/v1/team/download?slug=${encodeURIComponent(slug)}`;
+  if (version) {
+    manifestUrl += `&version=${encodeURIComponent(version)}`;
+  }
 
   let manifest;
   try { manifest = await httpGetJson(manifestUrl); }
@@ -1538,16 +1541,93 @@ async function cmdTeamInstall(apiBaseUrl, slug) {
     }
 
     if (foundPath) {
-      console.log(`    Found existing agent "${memberSlug}" -> ${foundPath}`);
-      resolvedMembers.push({
-        id: memberId,
-        local_path: foundPath,
-        slug: memberSlug,
-        role: memberRole,
-        ref_type: "MARKETPLACE",
-      });
+      // Check version conflict
+      const memberVersion = member.version; // from manifest
+      let installedVer = null;
+      const memberMetaPath = path.join(foundPath, ".agentar-meta.json");
+      if (fs.existsSync(memberMetaPath)) {
+        try {
+          const md = JSON.parse(fs.readFileSync(memberMetaPath, "utf-8"));
+          installedVer = md.installed_version || md.version || null;
+        } catch { /* ignore */ }
+      }
+
+      if (memberVersion && installedVer && memberVersion !== installedVer) {
+        // Version mismatch — prompt user
+        const answer = await prompt(
+          `    "${memberSlug}" (${installedVer}) is already installed. Team requires v${memberVersion}. Upgrade? [y/N] `
+        );
+        if (answer.toLowerCase() === "y") {
+          // Upgrade: backup existing, then reinstall
+          console.log(`    Upgrading "${memberSlug}" to v${memberVersion} ...`);
+          try {
+            backupDirectory(foundPath, `before-upgrade-${memberSlug}`);
+            const workspace = await installAgentar({
+              slug: memberSlug,
+              mode: "new",
+              apiBaseUrl,
+              agentName: path.basename(foundPath) || memberSlug,
+              version: memberVersion,
+            });
+            console.log(`    Upgraded agent "${memberSlug}" -> ${workspace}`);
+            resolvedMembers.push({
+              id: memberId, local_path: workspace, slug: memberSlug,
+              role: memberRole, ref_type: "MARKETPLACE",
+            });
+          } catch (err) {
+            console.error(`    Warning: failed to upgrade "${memberSlug}": ${err.message}. Using existing.`);
+            resolvedMembers.push({
+              id: memberId, local_path: foundPath, slug: memberSlug,
+              role: memberRole, ref_type: "MARKETPLACE",
+            });
+          }
+        } else {
+          console.log(`    Keeping existing "${memberSlug}" (${installedVer})`);
+          resolvedMembers.push({
+            id: memberId, local_path: foundPath, slug: memberSlug,
+            role: memberRole, ref_type: "MARKETPLACE",
+          });
+        }
+      } else if (memberVersion && !installedVer) {
+        // Unknown installed version — prompt
+        const answer = await prompt(
+          `    "${memberSlug}" (unknown version) is already installed. Team requires v${memberVersion}. Install? [y/N] `
+        );
+        if (answer.toLowerCase() === "y") {
+          console.log(`    Installing "${memberSlug}" v${memberVersion} ...`);
+          try {
+            backupDirectory(foundPath, `before-upgrade-${memberSlug}`);
+            const workspace = await installAgentar({
+              slug: memberSlug, mode: "new", apiBaseUrl,
+              agentName: path.basename(foundPath) || memberSlug, version: memberVersion,
+            });
+            resolvedMembers.push({
+              id: memberId, local_path: workspace, slug: memberSlug,
+              role: memberRole, ref_type: "MARKETPLACE",
+            });
+          } catch (err) {
+            console.error(`    Warning: failed to install "${memberSlug}": ${err.message}. Using existing.`);
+            resolvedMembers.push({
+              id: memberId, local_path: foundPath, slug: memberSlug,
+              role: memberRole, ref_type: "MARKETPLACE",
+            });
+          }
+        } else {
+          resolvedMembers.push({
+            id: memberId, local_path: foundPath, slug: memberSlug,
+            role: memberRole, ref_type: "MARKETPLACE",
+          });
+        }
+      } else {
+        // Same version or no version info — silently reuse
+        console.log(`    Found existing agent "${memberSlug}" -> ${foundPath}`);
+        resolvedMembers.push({
+          id: memberId, local_path: foundPath, slug: memberSlug,
+          role: memberRole, ref_type: "MARKETPLACE",
+        });
+      }
     } else {
-      // Install from marketplace
+      // Not installed — download with specific version if available
       console.log(`    Installing "${memberSlug}" from marketplace ...`);
       try {
         const workspace = await installAgentar({
@@ -1555,14 +1635,12 @@ async function cmdTeamInstall(apiBaseUrl, slug) {
           mode: "new",
           apiBaseUrl,
           agentName: memberSlug,
+          version: member.version || undefined,
         });
         console.log(`    Installed agent "${memberSlug}" -> ${workspace}`);
         resolvedMembers.push({
-          id: memberId,
-          local_path: workspace,
-          slug: memberSlug,
-          role: memberRole,
-          ref_type: "MARKETPLACE",
+          id: memberId, local_path: workspace, slug: memberSlug,
+          role: memberRole, ref_type: "MARKETPLACE",
         });
       } catch (err) {
         console.error(`Error: failed to install agent "${memberSlug}": ${err.message}`);
@@ -1916,7 +1994,7 @@ Export options:
       await cmdTeamSearch(apiBaseUrl, subArgs);
       break;
     case "install":
-      await cmdTeamInstall(apiBaseUrl, subArgs[0]);
+      await cmdTeamInstall(apiBaseUrl, subArgs[0], flags.version);
       break;
     case "list":
       await cmdTeamList();
