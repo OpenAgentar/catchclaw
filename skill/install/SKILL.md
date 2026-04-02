@@ -107,6 +107,16 @@ Install an agentar from the marketplace.
 - `--api-key <key>` — (Optional) API key to save into `skills/.credentials` for agentars that require backend authentication.
 - `--version <ver>` — (Optional) Install a specific version. When omitted, installs the latest version.
 
+**Version conflict handling:**
+When installing a specific version and the agent is already installed locally with a different version, the CLI will prompt:
+```
+"agent-name" (v1.0.0) is already installed. Install v1.4.0? [y/N]
+```
+- Answer `y` to backup the existing version and install the new one
+- Answer `N` (or Enter) to abort
+- Use `--overwrite` to skip the confirmation prompt
+- If the existing installation has no version metadata, the prompt shows "(unknown version)"
+
 ### Export
 
 ```bash
@@ -150,16 +160,28 @@ Search the CatchClaw marketplace for teams matching the keyword. Results include
 ### Team Install
 
 ```bash
-$CLI team install <slug>
+$CLI team install <slug> [--version <ver>]
 ```
 
 Install a team and all its member agents from the marketplace.
+
+**Options:**
+- `--version <ver>` — (Optional) Install a specific version of the team. When omitted, installs the latest version. The version is passed to the backend to fetch the corresponding team manifest snapshot with pinned member versions.
 
 **Behavior:**
 - Fetches the team manifest (name, members, collaboration type)
 - Installs each member agent as a new agent (or reuses if already installed locally)
 - Writes team registry to `~/.openclaw/agentar-teams/<slug>/team.yaml`
 - Updates each member's `AGENTS.md` with team coordination block
+
+**Member version conflict handling:**
+When a team specifies particular versions for its member agents, and a member is already installed locally with a different version, the CLI will prompt per member:
+```
+"agent-a" (v1.0.0) is already installed. Team requires v1.2.0. Upgrade? [y/N]
+```
+- Answer `y` to upgrade that member agent (with automatic backup)
+- Answer `N` to keep the existing version and continue installing remaining members
+- Declining a member upgrade does NOT abort the entire team installation
 
 ### Team List
 
