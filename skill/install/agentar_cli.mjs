@@ -878,6 +878,19 @@ async function installAgentar({ slug, mode, apiBaseUrl, agentName, apiKey, versi
   }
 
   if (apiKey) writeCredentials(targetWorkspace, apiKey);
+
+  // Write installed version to .agentar-meta.json for future conflict detection
+  const metaPath = path.join(targetWorkspace, ".agentar-meta.json");
+  try {
+    let meta = {};
+    if (fs.existsSync(metaPath)) {
+      try { meta = JSON.parse(fs.readFileSync(metaPath, "utf-8")); } catch { /* start fresh */ }
+    }
+    meta.installed_version = version || null;
+    meta.installed_at = new Date().toISOString();
+    fs.writeFileSync(metaPath, JSON.stringify(meta, null, 2));
+  } catch { /* best-effort, don't fail install */ }
+
   rmrf(tmpDir);
   return targetWorkspace;
 }
@@ -1970,6 +1983,70 @@ async function cmdList(apiBaseUrl) {
 async function cmdInstall(apiBaseUrl, opts) {
   const slug = opts.slug;
   if (!slug) { console.error("Error: slug required."); process.exit(1); }
+
+  // Check for existing installation with different version
+  if (opts.version) {
+    let conflictHandled = false;
+    const existingPath = path.join(WORKSPACES_DIR, slug);
+    const existingMeta = path.join(existingPath, ".agentar-meta.json");
+    if (fs.existsSync(existingMeta)) {
+      try {
+        const meta = JSON.parse(fs.readFileSync(existingMeta, "utf-8"));
+        const installedVer = meta.installed_version || meta.version;
+        if (installedVer && installedVer === opts.version) {
+          console.log(`"${slug}" v${opts.version} is already installed at ${existingPath}. Nothing to do.`);
+          return;
+        }
+        const verDisplay = installedVer || "unknown version";
+        if (!opts.overwrite) {
+          const answer = await prompt(
+            `"${slug}" (${verDisplay}) is already installed. Install v${opts.version}? [y/N] `
+          );
+          if (answer.toLowerCase() !== "y") {
+            console.log("Aborted.");
+            return;
+          }
+          // User confirmed — force overwrite mode for existing workspace
+          opts.overwrite = true;
+          conflictHandled = true;
+        }
+      } catch { /* meta unreadable, proceed normally */ }
+    }
+    // Also scan by .agentar-meta.json slug across all workspaces
+    if (!conflictHandled && fs.existsSync(WORKSPACES_DIR)) {
+      try {
+        for (const name of fs.readdirSync(WORKSPACES_DIR).sort()) {
+          if (name === slug) continue; // already checked above
+          const d = path.join(WORKSPACES_DIR, name);
+          const mp = path.join(d, ".agentar-meta.json");
+          if (!fs.existsSync(mp)) continue;
+          try {
+            const md = JSON.parse(fs.readFileSync(mp, "utf-8"));
+            if (md.slug === slug || (md.persona && md.persona.slug === slug)) {
+              const iv = md.installed_version || md.version;
+              if (iv && iv === opts.version) {
+                console.log(`"${slug}" v${opts.version} is already installed at ${d}. Nothing to do.`);
+                return;
+              }
+              const vd = iv || "unknown version";
+              if (!opts.overwrite) {
+                const answer = await prompt(
+                  `"${slug}" (${vd}) is already installed at ${d}. Install v${opts.version}? [y/N] `
+                );
+                if (answer.toLowerCase() !== "y") {
+                  console.log("Aborted.");
+                  return;
+                }
+                opts.overwrite = true;
+                opts.name = name; // overwrite the existing agent's workspace
+              }
+              break;
+            }
+          } catch { /* skip */ }
+        }
+      } catch { /* skip */ }
+    }
+  }
 
   let mode;
   if (opts.overwrite) {
