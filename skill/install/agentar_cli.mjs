@@ -16,8 +16,6 @@
  */
 
 import fs from "node:fs";
-import http from "node:http";
-import https from "node:https";
 import os from "node:os";
 import path from "node:path";
 import readline from "node:readline";
@@ -75,11 +73,16 @@ function getApiBaseUrl(cliArg) {
   return (cfg.api_base_url || DEFAULT_API_BASE_URL).replace(/\/+$/, "");
 }
 
-// ─── HTTP helpers ────────────────────────────────────────────────────────────
+// ─── HTTP helpers (GET-only, loaded on demand) ──────────────────────────────
+
+async function httpMod(url) {
+  return url.startsWith("https")
+    ? (await import("node:https")).default
+    : (await import("node:http")).default;
+}
 
 function httpGetJson(url) {
-  return new Promise((resolve, reject) => {
-    const mod = url.startsWith("https") ? https : http;
+  return httpMod(url).then((mod) => new Promise((resolve, reject) => {
     const req = mod.get(url, { timeout: 30000 }, (res) => {
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
         return httpGetJson(res.headers.location).then(resolve, reject);
@@ -97,12 +100,11 @@ function httpGetJson(url) {
     });
     req.on("error", reject);
     req.on("timeout", () => { req.destroy(); reject(new Error("Request timeout")); });
-  });
+  }));
 }
 
 function httpDownload(url, dest) {
-  return new Promise((resolve, reject) => {
-    const mod = url.startsWith("https") ? https : http;
+  return httpMod(url).then((mod) => new Promise((resolve, reject) => {
     const req = mod.get(url, { timeout: 120000 }, (res) => {
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
         return httpDownload(res.headers.location, dest).then(resolve, reject);
@@ -121,7 +123,7 @@ function httpDownload(url, dest) {
     });
     req.on("error", reject);
     req.on("timeout", () => { req.destroy(); reject(new Error("Download timeout")); });
-  });
+  }));
 }
 
 /** ZIP local file header signature (PK\x03\x04) */
