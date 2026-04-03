@@ -9,7 +9,7 @@ metadata:
     requires:
       bins:
         - node
-      env:
+      env_optional:
         - AGENTAR_API_BASE_URL
         - AGENTAR_HOME
       config:

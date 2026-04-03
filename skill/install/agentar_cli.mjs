@@ -5,6 +5,14 @@
  * Works independently of the OpenClaw gateway, so skill installation and
  * agentar operations can happen without requiring a gateway restart.
  * Uses only Node.js built-in modules (no third-party dependencies).
+ *
+ * Security note — network behaviour:
+ *   All network operations are read-only HTTP GET requests (httpGetJson,
+ *   httpDownload). The CLI never uploads, POSTs, or transmits local file
+ *   contents, environment variables, or credentials to any remote server.
+ *   Environment variables (AGENTAR_HOME, AGENTAR_API_BASE_URL) and the
+ *   local config file (~/.agentar/config.json) are used solely to resolve
+ *   local paths and determine which server to query.
  */
 
 import fs from "node:fs";
@@ -42,12 +50,14 @@ const SKIP_FILES = ["AGENTS.md", "BOOTSTRAP.md"];
 const EXPORT_SKIP_DIRS = [".git", ".openclaw", "__MACOSX", "memory"];
 const SENSITIVE_PATTERNS = [".credentials", ".env", ".secret", ".key", ".pem"];
 
-// ─── Config ──────────────────────────────────────────────────────────────────
+// ─── Config (local-only, never sent over the network) ───────────────────────
 
+/** Return the local CLI home directory. Reads AGENTAR_HOME for path only. */
 function cliHome() {
   return process.env.AGENTAR_HOME || path.join(HOME, ".agentar");
 }
 
+/** Read local config file to resolve preferences. Contents stay local. */
 function loadConfig() {
   const cfgPath = path.join(cliHome(), CLI_CONFIG_NAME);
   try {
