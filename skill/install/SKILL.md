@@ -82,6 +82,19 @@ Aligned with `metadata.openclaw.requires.config` and `metadata.json` in this ski
 | `~/.openclaw/agentar-teams/` | read/write | Team registries (`team install`, `team list`, `team status`) |
 | `<skill-dir>/skills/.credentials` | write (optional) | Written when install is run with `--api-key` |
 
+## Critical: Install Command Selection
+
+<HARD-GATE>
+When the user asks to install something, you MUST determine whether it is a single agentar or a team BEFORE running any command:
+
+- **Single agentar** → `$CLI install <slug> --name <name>`
+- **Team (agenteam)** → `$CLI team install <slug>`
+
+NEVER use `$CLI install` for teams. It will fail because teams are not individual agentars. If the instruction mentions "team", "agenteam", or the slug contains "team", use `$CLI team install`.
+
+If unsure, run `$CLI search <slug>` first — the result will show the type.
+</HARD-GATE>
+
 ## Commands
 
 ### Search
